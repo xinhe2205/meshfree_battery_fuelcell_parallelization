@@ -3,6 +3,8 @@ start_time = time.time()
 import numpy as np
 from numpy import sign
 
+import cupynumeric as cnp
+
 import matplotlib.pyplot as plt
 
 from tqdm import tqdm
@@ -252,7 +254,7 @@ from numpy.linalg import norm, eig
 
 
 @jit
-def compute_phi_M(x_G, Gauss_grain_id, x_nodes, nodes_grain_id, a, M, M_P_x, M_P_y, num_interface_segments, interface_nodes, BxByCxCy, IM_RKPM):
+def compute_phi_M_old(x_G, Gauss_grain_id, x_nodes, nodes_grain_id, a, M, M_P_x, M_P_y, num_interface_segments, interface_nodes, BxByCxCy, IM_RKPM):
 
     phi_nonzero_index_row = []
     phi_nonzero_index_column = []
@@ -500,6 +502,210 @@ def compute_phi_M(x_G, Gauss_grain_id, x_nodes, nodes_grain_id, a, M, M_P_x, M_P
     
     
 
+def compute_phi_M(x_G, Gauss_grain_id, x_nodes, nodes_grain_id, a, M, M_P_x, M_P_y, num_interface_segments, interface_nodes, BxByCxCy, IM_RKPM):
+    """
+    Fully cuNumeric vectorized implementation of compute_phi_M.
+    """
+    # Convert inputs to cuNumeric arrays
+    x_G = cnp.asarray(x_G)
+    x_nodes = cnp.asarray(x_nodes)
+    a = cnp.asarray(a)
+    nodes_grain_id = cnp.asarray(nodes_grain_id)
+    Gauss_grain_id = cnp.asarray(Gauss_grain_id)
+    interface_nodes_cnp = cnp.asarray(interface_nodes)
+    seg = cnp.asarray(BxByCxCy)
+
+    M = cnp.asarray(M)
+    M_P_x = cnp.asarray(M_P_x)
+    M_P_y = cnp.asarray(M_P_y)
+
+    n_G = x_G.shape[0]
+    n_N = x_nodes.shape[0]
+
+    # Normalize BxByCxCy to endpoints B (N,2) and C (N,2)
+    if seg.ndim == 2 and seg.shape[1] == 4:
+        B = seg[:, :2]
+        C = seg[:, 2:4]
+    elif seg.ndim == 3 and seg.shape[1] >= 2 and seg.shape[2] == 2:
+        B = seg[:, 0, :]
+        C = seg[:, 1, :]
+    elif seg.ndim == 3 and seg.shape[1] == 1 and seg.shape[2] == 2:
+        # Degenerate: only one point per segment; treat as point-segment (B=C)
+        B = seg[:, 0, :]
+        C = B
+    elif seg.ndim == 2 and seg.shape[1] == 2:
+        # Degenerate: provided as points; treat as B=C
+        B = seg
+        C = seg
+    else:
+        raise ValueError(f"Unexpected BxByCxCy shape: {tuple(seg.shape)}")
+
+    # Distances from Gauss points to line segments
+    BC = C - B
+    CB = -BC
+    BA = x_G[:, None, :] - B[None, :, :]
+    CA = x_G[:, None, :] - C[None, :, :]
+
+    BA_dot_BC = cnp.sum(BA * BC[None, :, :], axis=2)
+    CA_dot_CB = cnp.sum(CA * CB[None, :, :], axis=2)
+    sign_extension = BA_dot_BC * CA_dot_CB
+
+    BC_norm = cnp.sqrt(cnp.sum(BC * BC, axis=1))
+    BC_norm_safe = BC_norm + 1e-16
+
+    BA_dot_unit_BC = BA_dot_BC / BC_norm_safe[None, :]
+    BC_unit = BC[None, :, :] / BC_norm_safe[None, :, None]
+    proj = BC_unit * BA_dot_unit_BC[:, :, None]
+
+    dist_perp = cnp.sqrt(cnp.sum((BA - proj) ** 2, axis=2))
+    dist_CA = cnp.sqrt(cnp.sum(CA ** 2, axis=2))
+    dist_BA = cnp.sqrt(cnp.sum(BA ** 2, axis=2))
+    dist_end = cnp.minimum(dist_CA, dist_BA)
+
+    dx_distance = cnp.where(sign_extension > 0, dist_perp, dist_end)
+
+    row_idx = cnp.arange(n_G)
+    min_index = cnp.argmin(dx_distance, axis=1)
+    min_distance = dx_distance[row_idx, min_index]
+
+    pos_mask = sign_extension[row_idx, min_index] > 0
+    x_proj_pos = proj[row_idx, min_index, :] + B[min_index, :]
+    dist_CA_val = dist_CA[row_idx, min_index]
+    dist_BA_val = dist_BA[row_idx, min_index]
+    use_C = dist_CA_val < dist_BA_val
+    x_proj_negzero = cnp.where(use_C[:, None], C[min_index, :], B[min_index, :])
+    x_min = cnp.where(pos_mask[:, None], x_proj_pos, x_proj_negzero)
+
+    min_distance_safe = min_distance + 1e-16
+    d_distance_dx = (x_G[:, 0] - x_min[:, 0]) / min_distance_safe
+    d_distance_dy = (x_G[:, 1] - x_min[:, 1]) / min_distance_safe
+
+    # Smooth Heaviside
+    heaviside_scaling_factor = 4.0e-7
+    t = (min_distance + 1.0e-15) / heaviside_scaling_factor
+    heaviside = cnp.tanh(t)
+    sech2 = (1.0 / cnp.cosh(t)) ** 2
+    heaviside_P_x = d_distance_dx / heaviside_scaling_factor * sech2
+    heaviside_P_y = d_distance_dy / heaviside_scaling_factor * sech2
+
+    # Pairwise Gauss-node deltas
+    dx = x_G[:, None, 0] - x_nodes[None, :, 0]
+    dy = x_G[:, None, 1] - x_nodes[None, :, 1]
+    dist_to_node = cnp.sqrt(dx * dx + dy * dy)
+    z_ij = dist_to_node / (a[None, :] + 1e-16)
+
+    denom = a[None, :] * z_ij * a[None, :] + 2.220446049250313e-16
+    z_ij_P_x = dx / denom
+    z_ij_P_y = dy / denom
+
+    # Polynomial basis H
+    H_scaling_factor = 1.0e-6
+    H_T = cnp.zeros((n_G, n_N, 3), dtype=cnp.float64)
+    H_T[:, :, 0] = 1.0
+    H_T[:, :, 1] = dx / H_scaling_factor
+    H_T[:, :, 2] = dy / H_scaling_factor
+    H = H_T
+
+    HT_P_x = cnp.array([0.0, 1.0 / H_scaling_factor, 0.0], dtype=cnp.float64)
+    HT_P_y = cnp.array([0.0, 0.0, 1.0 / H_scaling_factor], dtype=cnp.float64)
+
+    # Shape function and derivative wrt z
+    mask_01 = (z_ij >= 0) & (z_ij < 0.5)
+    mask_051 = (z_ij >= 0.5) & (z_ij <= 1.0)
+    mask_in_support = (z_ij >= 0) & (z_ij <= 1.0)
+
+    phi = cnp.zeros_like(z_ij)
+    phi_P_z = cnp.zeros_like(z_ij)
+
+    z01 = z_ij[mask_01]
+    phi[mask_01] = 2.0 / 3 - 4 * z01 ** 2 + 4 * z01 ** 3
+    phi_P_z[mask_01] = -8.0 * z01 + 12.0 * z01 ** 2
+
+    z051 = z_ij[mask_051]
+    phi[mask_051] = 4.0 / 3 - 4 * z051 + 4 * z051 ** 2 - (4.0 / 3) * z051 ** 3
+    phi_P_z[mask_051] = -4.0 + 8.0 * z051 - 4.0 * z051 ** 2
+
+    # Interface node exclusion and grain matching
+    tol = 1e-10
+    #x_nodes_np = np.asarray(x_nodes)
+    #interface_nodes_np = np.asarray(interface_nodes)
+    node_on_interface = cnp.any(
+        (cnp.abs(x_nodes[:, None, 0] - interface_nodes[None, :, 0]) < tol)
+        & (cnp.abs(x_nodes[:, None, 1] - interface_nodes[None, :, 1]) < tol),
+        axis=1,
+    )
+    #node_on_interface = cnp.asarray(node_on_interface_np)
+    grainid_match = (nodes_grain_id[None, :] == Gauss_grain_id[:, None])
+
+    if IM_RKPM == 'True':
+        valid_mask = mask_in_support & (~node_on_interface[None, :]) & grainid_match
+        heav = heaviside[:, None]
+        heav_px = heaviside_P_x[:, None]
+        heav_py = heaviside_P_y[:, None]
+    else:
+        valid_mask = mask_in_support
+        heav = cnp.ones((n_G, 1), dtype=cnp.float64)
+        heav_px = cnp.zeros((n_G, 1), dtype=cnp.float64)
+        heav_py = cnp.zeros((n_G, 1), dtype=cnp.float64)
+
+    phi_final = cnp.where(valid_mask, phi * heav, 0.0)
+    phi_P_x = phi_P_z * z_ij_P_x
+    phi_P_y = phi_P_z * z_ij_P_y
+
+    if IM_RKPM == 'True':
+        phi_P_x_final = cnp.where(valid_mask, phi_P_x * heav + phi * heav_px, 0.0)
+        phi_P_y_final = cnp.where(valid_mask, phi_P_y * heav + phi * heav_py, 0.0)
+    else:
+        phi_P_x_final = cnp.where(valid_mask, phi_P_x, 0.0)
+        phi_P_y_final = cnp.where(valid_mask, phi_P_y, 0.0)
+
+    # Non-zero entries
+    nz_i, nz_j = cnp.where(valid_mask)
+
+    phi_nonzero_index_row = nz_i.tolist()
+    phi_nonzero_index_column = nz_j.tolist()
+    phi_nonzerovalue_data = phi_final[valid_mask].tolist()
+    phi_P_x_nonzerovalue_data = phi_P_x_final[valid_mask].tolist()
+    phi_P_y_nonzerovalue_data = phi_P_y_final[valid_mask].tolist()
+
+    # Moment matrices updates via scatter-add
+    H_sel = H[nz_i, nz_j]
+    HT_sel = H_T[nz_i, nz_j]
+
+    outer = H_sel[:, :, None] * HT_sel[:, None, :]
+    HT_P_x_b = cnp.broadcast_to(HT_P_x[None, :], HT_sel.shape)
+    HT_P_y_b = cnp.broadcast_to(HT_P_y[None, :], HT_sel.shape)
+
+    outer_P_x_1 = HT_P_x_b[:, :, None] * HT_sel[:, None, :]
+    outer_P_x_2 = H_sel[:, :, None] * HT_P_x_b[:, None, :]
+    outer_P_y_1 = HT_P_y_b[:, :, None] * HT_sel[:, None, :]
+    outer_P_y_2 = H_sel[:, :, None] * HT_P_y_b[:, None, :]
+
+    phi_v = phi_final[valid_mask]
+    phi_px_v = phi_P_x_final[valid_mask]
+    phi_py_v = phi_P_y_final[valid_mask]
+
+    M_updates = outer * phi_v[:, None, None]
+    M_P_x_updates = outer * phi_px_v[:, None, None] + (outer_P_x_1 + outer_P_x_2) * phi_v[:, None, None]
+    M_P_y_updates = outer * phi_py_v[:, None, None] + (outer_P_y_1 + outer_P_y_2) * phi_v[:, None, None]
+
+    cnp.add.at(M, nz_i, M_updates)
+    cnp.add.at(M_P_x, nz_i, M_P_x_updates)
+    cnp.add.at(M_P_y, nz_i, M_P_y_updates)
+
+    # Save distance-related outputs as lists
+    idx_arr = cnp.arange(n_G)
+    save_distance_function = cnp.stack((idx_arr.astype(cnp.float64), x_G[:, 0], x_G[:, 1], min_distance), axis=1).tolist()
+    save_distance_function_dx = cnp.stack((idx_arr.astype(cnp.float64), x_G[:, 0], x_G[:, 1], d_distance_dx), axis=1).tolist()
+    save_distance_function_dy = cnp.stack((idx_arr.astype(cnp.float64), x_G[:, 0], x_G[:, 1], d_distance_dy), axis=1).tolist()
+    save_point_D_coor = x_min.tolist()
+
+    save_heavyside = heaviside.tolist()
+    save_heavyside_px = heaviside_P_x.tolist()
+    save_heavyside_py = heaviside_P_y.tolist()
+
+    return save_distance_function, save_distance_function_dx, save_distance_function_dy, save_point_D_coor, save_heavyside, save_heavyside_px, save_heavyside_py, phi_nonzero_index_row, phi_nonzero_index_column, phi_nonzerovalue_data, phi_P_x_nonzerovalue_data, phi_P_y_nonzerovalue_data, M, M_P_x, M_P_y
+
 # @jit  # this is taking so long time, we are vectorizing this part
 def shape_grad_shape_func(x_G,x_nodes, num_non_zero_phi_a,HT0, M, M_P_x, M_P_y, differential_method, HT1, HT2, phi_nonzerovalue_data,phi_P_x_nonzerovalue_data,phi_P_y_nonzerovalue_data, phi_nonzero_index_row, phi_nonzero_index_column, det_J_time_weight, IM_RKPM):
     # shape_func_value = []
@@ -597,11 +803,16 @@ def shape_grad_shape_func(x_G,x_nodes, num_non_zero_phi_a,HT0, M, M_P_x, M_P_y, 
     
     # Get M matrices for all relevant Gauss points
     M_selected = M[i_indices]  # Shape: (num_non_zero_phi_a, 3, 3)
-    M_inv_selected = np.linalg.inv(M_selected.astype(np.float64))  # Shape: (num_non_zero_phi_a, 3, 3)
+    # Regularize to avoid singular matrices
+    M_selected_np = M_selected.astype(np.float64)
+    reg_eps = 1e-12
+    eye3 = np.eye(3, dtype=np.float64)
+    M_selected_reg = M_selected_np + eye3[None, :, :] * reg_eps
+    M_inv_selected = np.linalg.inv(M_selected_reg)  # Shape: (num_non_zero_phi_a, 3, 3)
     
     # Vectorized shape function computation
     # HT0 @ M_inv @ H for all entries
-    HT0_M_inv = np.dot(HT0, M_inv_selected.transpose(1, 2, 0)).T  # Shape: (num_non_zero_phi_a, 3)
+    HT0_M_inv = np.dot(HT0, M_inv_selected.transpose((1, 2, 0))).T  # Shape: (num_non_zero_phi_a, 3)
     shape_func_values = np.sum(HT0_M_inv * H_vectorized, axis=1) * phi_nonzerovalue_data
     
     # Vectorized gradient computation
@@ -609,8 +820,8 @@ def shape_grad_shape_func(x_G,x_nodes, num_non_zero_phi_a,HT0, M, M_P_x, M_P_y, 
         HT1 = np.array(HT1, dtype=np.float64)
         HT2 = np.array(HT2, dtype=np.float64)
         
-        HT1_M_inv = np.dot(HT1, M_inv_selected.transpose(1, 2, 0)).T
-        HT2_M_inv = np.dot(HT2, M_inv_selected.transpose(1, 2, 0)).T
+        HT1_M_inv = np.dot(HT1, M_inv_selected.transpose((1, 2, 0))).T
+        HT2_M_inv = np.dot(HT2, M_inv_selected.transpose((1, 2, 0))).T
         
         grad_shape_func_x_values = np.sum(HT1_M_inv * H_vectorized, axis=1) * phi_nonzerovalue_data
         grad_shape_func_y_values = np.sum(HT2_M_inv * H_vectorized, axis=1) * phi_nonzerovalue_data
@@ -633,8 +844,8 @@ def shape_grad_shape_func(x_G,x_nodes, num_non_zero_phi_a,HT0, M, M_P_x, M_P_y, 
         term1_y = np.sum(HT0_M_inv * H_vectorized, axis=1) * phi_P_y_nonzerovalue_data
         
         # Term 2: HT0 @ M_inv_P_x @ H * phi
-        HT0_M_inv_P_x = np.dot(HT0, M_inv_P_x_selected.transpose(1, 2, 0)).T
-        HT0_M_inv_P_y = np.dot(HT0, M_inv_P_y_selected.transpose(1, 2, 0)).T
+        HT0_M_inv_P_x = np.dot(HT0, M_inv_P_x_selected.transpose((1, 2, 0))).T
+        HT0_M_inv_P_y = np.dot(HT0, M_inv_P_y_selected.transpose((1, 2, 0))).T
         term2_x = np.sum(HT0_M_inv_P_x * H_vectorized, axis=1) * phi_nonzerovalue_data
         term2_y = np.sum(HT0_M_inv_P_y * H_vectorized, axis=1) * phi_nonzerovalue_data
         
