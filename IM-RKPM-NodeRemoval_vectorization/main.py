@@ -47,8 +47,8 @@ y_max = 10e-6
 ###############################
 # Define time step
 ###############################
-t = 100.0              # simulate for 10s
-nt = 1000             # nt is the number of time steps
+t = 1.0              # simulate for 10s
+nt = 100             # nt is the number of time steps
 dt = t/nt            # time step
 
 IM_RKPM = 'True'  # if it is interfacial modified RKPM
@@ -139,8 +139,9 @@ else:
     cell_nodes_list, grain_id, grain_id_bottom, grain_id_top, grain_id_left, grain_id_right, cell_shape, num_rec_cell, num_tri_cell, x_nodes, nodes_grain_id, bottom_boundary_cell_nodes_list, right_boundary_cell_nodes_list, top_boundary_cell_nodes_list, left_boundary_cell_nodes_list, repeated_vertex, interface_segments, x_nodes_interface_unique, x_nodes_interface_unique_id  = get_x_nodes_multi_grain(x_min,x_max,y_min,y_max, num_pixels_x, num_pixels_y, img_)
     
     num_interface_segments = np.shape(interface_segments)[0]
-    interface_nodes = np.asarray(interface_segments).reshape(num_interface_segments*2, 2) # interface nodes has repeated nodes on interface, while x_nodes_interface_unique is unique.
-    BxByCxCy = np.asarray(interface_segments).reshape(num_interface_segments, 4)  # the first column is x coordinates of point B, ......
+    _ifs = np.asarray(interface_segments)
+    interface_nodes = _ifs.reshape(num_interface_segments*2, 2) # interface nodes has repeated nodes on interface, while x_nodes_interface_unique is unique.
+    BxByCxCy = _ifs.reshape(num_interface_segments, 4)  # the first column is x coordinates of point B, ......
 
     boundary_nodes = np.asarray(bottom_boundary_cell_nodes_list+top_boundary_cell_nodes_list+left_boundary_cell_nodes_list+right_boundary_cell_nodes_list)
     
@@ -607,11 +608,14 @@ for ii in range(50):
         # calculate the value at RPK nodes
         #########################################
             
+        # Small diagonal regularization to prevent exact singularity
+        K = K + sp.eye(K.shape[0], format='csc') * 1.0e-6
         du = spsolve(K, f)
         # du = np.dot(np.linalg.inv(K.toarray()), f)
-
-        dc[:,0] = du[0:num_nodes]
-        dphi[:,0] = du[num_nodes:]
+        # Apply damping to improve robustness of Newton updates
+        damping = 1.0e-3
+        dc[:,0] = damping * du[0:num_nodes]
+        dphi[:,0] = damping * du[num_nodes:]
 
         print('Number of Newton Iteration: ' + str(newton_iter_num), 'in Time Step: '+str(ii), np.linalg.norm(dc)/(c_max*ini_charge_state), np.linalg.norm(dphi))
         
